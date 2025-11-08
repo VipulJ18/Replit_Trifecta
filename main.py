@@ -3,23 +3,30 @@ import json
 import re
 import time
 import requests
+import traceback
+import google.generativeai as genai
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
 
 from flask import Flask, request, jsonify, send_from_directory
-from openai import OpenAI
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
 app = Flask(__name__, static_folder='static')
 
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 SLACK_BOT_TOKEN = os.getenv('SLACK_BOT_TOKEN')
 GITHUB_TOKEN = os.getenv('GITHUB_TOKEN')
 
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+# Configure Gemini
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel('gemini-2.5-flash')
+else:
+    model = None
+
 slack_client = WebClient(token=SLACK_BOT_TOKEN) if SLACK_BOT_TOKEN else None
 
 CHANNEL_MAPPING = {
@@ -164,42 +171,38 @@ def fetch_diff(diff_url):
 
 def analyze_with_ai(diff_content):
     try:
-        if not openai_client:
-            print("Warning: OpenAI client not initialized")
+        if not model:
+            print("Warning: Gemini model not initialized")
             return {"verdict": "NEEDS_REVIEW", "comment": "AI analysis unavailable - manual review required"}
         
         prompt = (
-            "You are a senior developer acting as a code reviewer. "
-            "Analyze this code diff and classify its severity. "
-            "Respond only in a valid JSON format with two keys: "
-            "1) 'verdict': (choose one: 'GOOD', 'NEEDS_REVIEW', or 'CRITICAL') "
-            "and 2) 'comment': (your brief, one-sentence review)."
+            "You are a senior software engineer acting as a code reviewer. "
+            "Analyze the provided code diff and answer: What is the issue here? "
+            "Respond in natural human language with a brief, clear explanation."
         )
         
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": f"Code diff:\n\n{diff_content[:4000]}"}
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.3
+        response = model.generate_content([prompt, f"Code diff:\n\n{diff_content[:4000]}"])
+        
+        result_text = response.text if response.text else "No response from AI"
+        
+        # Since we're getting natural language, we need to determine the verdict
+        # We'll do this by asking the AI to classify the severity
+        classification_prompt = (
+            "Based on the issue description, classify the severity as either 'CRITICAL', 'NEEDS_REVIEW', or 'GOOD'. "
+            "Respond with only one word: CRITICAL, NEEDS_REVIEW, or GOOD."
         )
         
-        result_text = response.choices[0].message.content
-        if not result_text:
-            return {"verdict": "NEEDS_REVIEW", "comment": "AI returned empty response"}
-        result = json.loads(result_text)
+        classification_response = model.generate_content([classification_prompt, result_text])
+        verdict = classification_response.text.strip().upper() if classification_response.text else "NEEDS_REVIEW"
         
-        if 'verdict' not in result or 'comment' not in result:
-            print(f"Warning: AI response missing required fields: {result}")
-            return {"verdict": "NEEDS_REVIEW", "comment": "AI response incomplete - manual review required"}
-        
-        return result
+        if verdict not in ['CRITICAL', 'NEEDS_REVIEW', 'GOOD']:
+            verdict = 'NEEDS_REVIEW'  # Default fallback
+            
+        return {"verdict": verdict, "comment": result_text}
         
     except Exception as e:
         print(f"Error in AI analysis: {str(e)}")
-        return {"verdict": "NEEDS_REVIEW", "comment": f"AI analysis error - manual review required"}
+        return {"verdict": "NEEDS_REVIEW", "comment": f"AI analysis error: {str(e)} - manual review required"}
 
 
 def send_to_slack(verdict, comment, pr_url):
@@ -300,7 +303,7 @@ def status():
         "status": "running",
         "webhook_endpoint": "/api/github-webhook",
         "integrations": {
-            "openai": "configured" if OPENAI_API_KEY else "missing OPENAI_API_KEY",
+            "gemini": "configured" if GEMINI_API_KEY else "missing GEMINI_API_KEY",
             "slack": "configured" if SLACK_BOT_TOKEN else "missing SLACK_BOT_TOKEN",
             "github": "configured" if GITHUB_TOKEN else "missing GITHUB_TOKEN"
         }
