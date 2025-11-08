@@ -112,10 +112,10 @@ def analyze_with_ai(diff_content):
             temperature=0.3
         )
         
-        result_text = response.choices[0].message.content
-        if not result_text:
+        ai_response_text = response.choices[0].message.content
+        if not ai_response_text:
             return {"verdict": "NEEDS_REVIEW", "comment": "AI returned empty response"}
-        result = json.loads(result_text)
+        result = json.loads(ai_response_text)
         
         if 'verdict' not in result or 'comment' not in result:
             print(f"Warning: AI response missing required fields: {result}")
