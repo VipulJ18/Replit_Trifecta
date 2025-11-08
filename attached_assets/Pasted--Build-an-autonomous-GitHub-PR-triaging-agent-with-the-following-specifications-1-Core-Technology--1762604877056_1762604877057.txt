@@ -1,0 +1,43 @@
+
+Build an autonomous GitHub PR triaging agent with the following specifications:
+1. Core Technology:
+* Build the application using Python.
+* Use the Flask web framework as the server.
+2. Configuration & Secrets:
+* The application must be configured using environment variables (Replit Secrets).
+* Use the secret OPENAI_API_KEY for OpenAI.
+* Use the secret SLACK_BOT_TOKEN for the Slack API.
+* Use the secret SLACK_SIGNING_SECRET for verifying Slack requests (if needed for the connector).
+3. Connectors:
+* Add and configure the Replit GitHub Connector (for authentication).
+* Add and configure the Replit OpenAI Connector.
+* Add and configure the Replit Slack Connector.
+4. Webhook Endpoint:
+* Create a single Flask endpoint at /api/github-webhook that accepts POST requests.
+* This endpoint will receive all GitHub webhooks.
+5. GitHub "Pull Request" Logic:
+* In the /api/github-webhook endpoint, parse the webhook payload.
+* Only proceed if the event is pull_request and the action is opened. For all other events, immediately return a {"status": "ignored"} JSON response with a 200 status code.
+* From the pull_request payload, extract the diff_url and the html_url (the public link to the PR).
+* Using the authenticated GitHub Connector, fetch the raw text content from the diff_url.
+6. AI Analysis (The "Brain"):
+* Take the raw diff text.
+* Send this text to the OpenAI Connector.
+* Use the following prompt: "You are a senior developer acting as a code reviewer. Analyze this code diff and classify its severity. Respond only in a valid JSON format with two keys: 1) 'verdict': (choose one: 'GOOD', 'NEEDS_REVIEW', or 'CRITICAL') and 2) 'comment': (your brief, one-sentence review)." 
+* Parse the JSON response from the AI.
+7. Smart Slack Routing (The "Action"):
+* Implement conditional logic based on the AI's "verdict":
+* If verdict is 'CRITICAL':
+    * Use the Slack Connector to post a message to the #dev-urgent Slack channel.
+    * The message format should be: "🚨 CRITICAL PR: @here AI found a critical issue. [Your AI comment] [Link to PR]"
+* If verdict is 'NEEDS_REVIEW':
+    * Use the Slack Connector to post a message to the #dev-main Slack channel.
+    * The message format should be: "👀 Review Needed: [Your AI comment] [Link to PR]"
+* If verdict is 'GOOD':
+    * Use the Slack Connector to post a message to the #dev-feed Slack channel.
+    * The message format should be: "✅ PR Approved: AI review passed. [Your AI comment] [Link to PR]"
+* (Use the html_url from step 5 for the "[Link to PR]")
+8. Error Handling:
+* The entire process must be wrapped in a try...except block.
+* If any step fails (e.g., AI fails, Slack API is down), log the internal error to the console.
+* Crucially: No matter what happens, always return a {"status": "success"} or {"status": "error"} response with a 200 OK status code to GitHub. This prevents GitHub from disabling the webhook due to timeouts.
