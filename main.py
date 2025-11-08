@@ -1,16 +1,23 @@
 import os
 import json
+import re
+import time
 import requests
-from flask import Flask, request, jsonify
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+from flask import Flask, request, jsonify, send_from_directory
 from openai import OpenAI
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder='static')
 
-OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
-SLACK_BOT_TOKEN = os.environ.get('SLACK_BOT_TOKEN')
-GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+SLACK_BOT_TOKEN = os.getenv('SLACK_BOT_TOKEN')
+GITHUB_TOKEN = os.getenv('GITHUB_TOKEN')
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 slack_client = WebClient(token=SLACK_BOT_TOKEN) if SLACK_BOT_TOKEN else None
@@ -20,6 +27,9 @@ CHANNEL_MAPPING = {
     'NEEDS_REVIEW': '#dev-main',
     'GOOD': '#dev-feed'
 }
+
+# URL pattern for validating GitHub PR URLs
+PR_URL_PATTERN = re.compile(r'^https://github\.com/([^/]+)/([^/]+)/pull/(\d+)(?:/.*)?$')
 
 @app.route('/api/github-webhook', methods=['POST'])
 def github_webhook():
@@ -74,7 +84,71 @@ def github_webhook():
         return jsonify({"status": "error", "message": str(e)}), 200
 
 
+def validate_pr_url(pr_url):
+    """Validate GitHub PR URL and extract owner, repo, and PR number"""
+    match = PR_URL_PATTERN.match(pr_url)
+    if not match:
+        return None, None, None
+    return match.group(1), match.group(2), match.group(3)
+
+
+def fetch_pr_diff(owner, repo, pr_number):
+    """Fetch PR diff using GitHub API with proper headers and authentication"""
+    # Try primary endpoint first
+    url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
+    headers = {
+        "Accept": "application/vnd.github.v3.diff",
+        "User-Agent": "GitHub-PR-Triaging-Agent"
+    }
+    
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    
+    # Retry logic for rate limiting and transient errors
+    for attempt in range(3):
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            
+            # Handle rate limiting
+            if response.status_code == 429:
+                reset_time = int(response.headers.get('X-RateLimit-Reset', 0))
+                current_time = int(time.time())
+                wait_time = min(reset_time - current_time + 1, 60)  # Max 60 seconds
+                if wait_time > 0:
+                    time.sleep(wait_time)
+                continue
+            
+            # Handle other server errors
+            if response.status_code >= 500:
+                time.sleep(2 ** attempt)  # Exponential backoff
+                continue
+                
+            response.raise_for_status()
+            return response.text
+            
+        except requests.exceptions.RequestException as e:
+            if attempt == 2:  # Last attempt
+                raise e
+            time.sleep(2 ** attempt)  # Exponential backoff
+    
+    return None
+
+
+def fetch_pr_diff_fallback(owner, repo, pr_number):
+    """Fallback method to fetch PR diff"""
+    url = f"https://patch-diff.githubusercontent.com/raw/{owner}/{repo}/pull/{pr_number}.diff"
+    
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        return response.text
+    except Exception as e:
+        print(f"Fallback diff fetch failed: {str(e)}")
+        return None
+
+
 def fetch_diff(diff_url):
+    """Original diff fetching function for webhook compatibility"""
     try:
         headers = {}
         if GITHUB_TOKEN:
@@ -159,8 +233,68 @@ def send_to_slack(verdict, comment, pr_url):
         return False
 
 
+@app.route('/api/analyze-pr', methods=['POST'])
+def analyze_pr_endpoint():
+    """New endpoint for analyzing PRs directly from the UI"""
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"ok": False, "code": "INVALID_JSON", "message": "Invalid JSON payload"}), 400
+            
+        pr_url = data.get('pr_url')
+        
+        if not pr_url:
+            return jsonify({"ok": False, "code": "MISSING_URL", "message": "PR URL is required"}), 400
+        
+        # Validate PR URL
+        owner, repo, pr_number = validate_pr_url(pr_url)
+        if not owner or not repo or not pr_number:
+            return jsonify({"ok": False, "code": "INVALID_URL", "message": "Invalid GitHub PR URL format"}), 400
+        
+        # Check if GitHub token is configured
+        if not GITHUB_TOKEN:
+            return jsonify({"ok": False, "code": "MISSING_TOKEN", "message": "GITHUB_TOKEN is not set. Provide a classic token with 'repo' or a fine-grained token with Pull Requests: Read."}), 500
+        
+        # Fetch PR diff
+        diff_content = fetch_pr_diff(owner, repo, pr_number)
+        if not diff_content:
+            # Try fallback method
+            diff_content = fetch_pr_diff_fallback(owner, repo, pr_number)
+            if not diff_content:
+                return jsonify({"ok": False, "code": "FETCH_FAILED", "message": "Failed to fetch PR diff. Check token permissions or try again later."}), 500
+        
+        # Analyze with AI
+        ai_result = analyze_with_ai(diff_content)
+        if not ai_result:
+            return jsonify({"ok": False, "code": "AI_FAILED", "message": "AI analysis failed"}), 500
+        
+        verdict = ai_result.get('verdict')
+        comment = ai_result.get('comment')
+        
+        return jsonify({
+            "ok": True,
+            "verdict": verdict,
+            "comment": comment,
+            "pr_url": pr_url
+        }), 200
+        
+    except Exception as e:
+        print(f"Error in analyze PR endpoint: {str(e)}")
+        return jsonify({"ok": False, "code": "INTERNAL_ERROR", "message": str(e)}), 500
+
+
 @app.route('/', methods=['GET'])
-def home():
+def index():
+    return send_from_directory('static', 'index.html')
+
+
+@app.route('/<path:path>')
+def static_files(path):
+    return send_from_directory('static', path)
+
+
+@app.route('/status', methods=['GET'])
+def status():
     return jsonify({
         "service": "GitHub PR Triaging Agent",
         "status": "running",
